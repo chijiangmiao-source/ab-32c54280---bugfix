@@ -109,6 +109,10 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	operationHash := requestHash(equipment, *req.OperationID, *req.SeenRevision,
 		*req.Lower, *req.Upper, content)
+	// Fast path: replay a known operation without opening a transaction. A
+	// miss here is not authoritative — a concurrent duplicate of the same
+	// operation may commit before Publish acquires the head lock, so Publish
+	// re-checks the ledger inside the transaction.
 	replay, err := s.st.LookupReplay(r.Context(), equipment, *req.OperationID, operationHash)
 	if err != nil {
 		writeStoreError(w, err)

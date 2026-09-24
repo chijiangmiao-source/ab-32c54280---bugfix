@@ -1,9 +1,9 @@
 // Command verify is the one-shot acceptance harness for the calibration
 // service. It runs build checks and unit tests against the source tree, then
 // exercises a running service over HTTP (interval splitting, history
-// immutability, idempotent replay, concurrent stale-revision conflicts and
-// error stability), and finally exits 0 when everything passed and 1
-// otherwise.
+// immutability, idempotent replay, concurrent duplicate first-publishes,
+// concurrent stale-revision conflicts and error stability), and finally
+// exits 0 when everything passed and 1 otherwise.
 //
 // Configuration is via environment:
 //
@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -55,6 +56,7 @@ func main() {
 	step("HTTP smoke: interval splitting and coverage", scenarioSplit)
 	step("HTTP smoke: history immutability via API", scenarioHistory)
 	step("HTTP smoke: idempotent replay and operation conflict", scenarioIdempotency)
+	step("HTTP smoke: concurrent duplicate first-publish", scenarioConcurrentDuplicate)
 	step("HTTP smoke: concurrent stale-revision conflict", scenarioConcurrency)
 	step("HTTP smoke: validation and stable errors", scenarioValidation)
 	if dbURL != "" {
@@ -122,34 +124,44 @@ func waitHealthy() error {
 }
 
 func doJSON(method, rawURL, body string) (int, []byte, error) {
+	st, _, b, err := doJSONFull(method, rawURL, body)
+	return st, b, err
+}
+
+func doJSONFull(method, rawURL, body string) (int, http.Header, []byte, error) {
 	var rdr io.Reader
 	if body != "" {
 		rdr = strings.NewReader(body)
 	}
 	req, err := http.NewRequest(method, rawURL, rdr)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
-	return resp.StatusCode, b, nil
+	return resp.StatusCode, resp.Header, b, nil
 }
 
 func publish(eq, op string, seen, lower, upper int64, content string) (int, []byte, error) {
+	st, _, b, err := publishFull(eq, op, seen, lower, upper, content)
+	return st, b, err
+}
+
+func publishFull(eq, op string, seen, lower, upper int64, content string) (int, http.Header, []byte, error) {
 	body := fmt.Sprintf(
 		`{"operation_id":%q,"seen_revision":%d,"lower":%d,"upper":%d,"content":%s}`,
 		op, seen, lower, upper, content)
-	return doJSON(http.MethodPost,
+	return doJSONFull(http.MethodPost,
 		fmt.Sprintf("%s/v1/equipments/%s/calibrations", appURL, url.PathEscape(eq)), body)
 }
 
@@ -490,6 +502,134 @@ func scenarioIdempotency() error {
 	}
 	// The head is still revision 2.
 	return expectQuery(eq, 55, "", 2, 50, 60, `"Z"`)
+}
+
+// scenarioConcurrentDuplicate races identical first-time publishes of one
+// business operation — same operation id, seen revision, interval and
+// content, as when two engineering workstations retry one backfill — against
+// an equipment that already has a current revision. Exactly one publish may
+// actually happen; every concurrent call, and every later retry, must
+// receive the first publish's success result, and the head must advance by
+// exactly one.
+func scenarioConcurrentDuplicate() error {
+	eq := uniqueEq("EQ-DUP")
+	if err := expectPublish(eq, uniqueOp("d0"), 0, 0, 100, `"BASE"`, 1,
+		seg(0, 100, `"BASE"`)); err != nil {
+		return err
+	}
+
+	// The identical backfill fired concurrently: one operation id, one seen
+	// revision, one interval, one content. A start barrier maximizes the
+	// chance that the racers overlap inside the publish transaction.
+	op := uniqueOp("dup")
+	const racers = 6
+	type outcome struct {
+		status int
+		replay bool
+		body   []byte
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			st, hdr, body, err := publishFull(eq, op, 1, 20, 80, `{"k":9}`)
+			results <- outcome{st, hdr.Get("X-Idempotent-Replay") == "true", body, err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var first []byte
+	fresh := 0
+	for o := range results {
+		if o.err != nil {
+			return fmt.Errorf("duplicate racer failed: %w", o.err)
+		}
+		if o.status != http.StatusCreated {
+			return fmt.Errorf("duplicate racer: status %d, want 201 (body %s)", o.status, o.body)
+		}
+		if !o.replay {
+			fresh++
+		}
+		if first == nil {
+			first = o.body
+		} else if !bytes.Equal(o.body, first) {
+			return fmt.Errorf("duplicate racers disagree: %s vs %s", o.body, first)
+		}
+	}
+	if fresh != 1 {
+		return fmt.Errorf("fresh publishes = %d, want exactly 1 (the rest must be replays)", fresh)
+	}
+
+	// The single success result: revision 2 with the expected snapshot.
+	var pr publishResponse
+	if err := json.Unmarshal(first, &pr); err != nil {
+		return fmt.Errorf("duplicate publish response not JSON: %v (%s)", err, first)
+	}
+	if pr.Revision != 2 {
+		return fmt.Errorf("duplicate publish revision = %d, want 2", pr.Revision)
+	}
+	if err := expectSegments(pr.Segments, []segment{
+		seg(0, 20, `"BASE"`), seg(20, 80, `{"k":9}`), seg(80, 100, `"BASE"`),
+	}); err != nil {
+		return err
+	}
+
+	// The final head snapshot matches the published result exactly.
+	for _, tc := range []struct {
+		batch        int64
+		lower, upper int64
+		content      string
+	}{
+		{10, 0, 20, `"BASE"`},
+		{50, 20, 80, `{"k":9}`},
+		{90, 80, 100, `"BASE"`},
+	} {
+		if err := expectQuery(eq, tc.batch, "", 2, tc.lower, tc.upper, tc.content); err != nil {
+			return err
+		}
+	}
+
+	// A later serial retry replays the first result...
+	st, hdr, body, err := publishFull(eq, op, 1, 20, 80, `{"k":9}`)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated || !bytes.Equal(body, first) ||
+		hdr.Get("X-Idempotent-Replay") != "true" {
+		return fmt.Errorf("serial retry: status %d replay=%q body %s, want 201 replay=true %s",
+			st, hdr.Get("X-Idempotent-Replay"), body, first)
+	}
+	// ...while the same operation id with different parameters conflicts.
+	st, body, err = publish(eq, op, 1, 20, 80, `{"k":10}`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "OPERATION_CONFLICT"); err != nil {
+		return fmt.Errorf("parameter-mutated reuse after race: %w", err)
+	}
+
+	// The head advanced by exactly one despite the race...
+	if err := expectPublish(eq, uniqueOp("d-next"), 2, 100, 120, `"TAIL"`, 3,
+		seg(0, 20, `"BASE"`), seg(20, 80, `{"k":9}`), seg(80, 100, `"BASE"`),
+		seg(100, 120, `"TAIL"`)); err != nil {
+		return fmt.Errorf("head did not advance by exactly one: %w", err)
+	}
+	// ...and the duplicate operation still replays its first result.
+	st, body, err = publish(eq, op, 1, 20, 80, `{"k":9}`)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated || !bytes.Equal(body, first) {
+		return fmt.Errorf("replay after head moved: status %d body %s, want 201 %s", st, body, first)
+	}
+	return nil
 }
 
 // scenarioConcurrency races several publishes on the same seen revision:

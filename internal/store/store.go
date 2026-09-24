@@ -12,7 +12,10 @@
 // Every publish runs in a single transaction that locks the equipment's head
 // row with SELECT ... FOR UPDATE. The lock serializes publishers per
 // equipment, so two publishes racing on the same seen revision cannot both
-// succeed, and a failed transaction leaves no partial split behind.
+// succeed, and a failed transaction leaves no partial split behind. The
+// idempotency ledger is consulted under that lock, before the revision
+// check, so concurrent duplicates of the same operation replay the first
+// result instead of failing with a stale revision error.
 package store
 
 import (
@@ -146,10 +149,11 @@ type PublishResult struct {
 
 // Publish atomically validates and applies a publish call.
 //
-// Ordering inside the transaction matters: the idempotency ledger is checked
-// before the revision check so that a legitimate retry of an already applied
-// operation replays its first result instead of failing with a stale
-// revision error.
+// Ordering inside the transaction matters: the idempotency ledger is
+// consulted under the head lock, before the revision check, so that a
+// concurrent duplicate or later retry of an already applied operation
+// replays its first result instead of failing with a stale revision error,
+// while the same operation id with different parameters always conflicts.
 func (s *Store) Publish(ctx context.Context, p PublishParams) (*PublishResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -169,6 +173,37 @@ func (s *Store) Publish(ctx context.Context, p PublishParams) (*PublishResult, e
 		`SELECT revision FROM heads WHERE equipment = $1 FOR UPDATE`, p.Equipment,
 	).Scan(&head); err != nil {
 		return nil, err
+	}
+
+	// Idempotency under the lock: a concurrent duplicate of an operation
+	// that the previous lock holder has just committed finds the ledger row
+	// here and replays the stored first result; the same operation id with
+	// different parameters is a conflict. Both outcomes precede the revision
+	// check so that a legitimate retry never fails with a stale revision.
+	var (
+		storedHash     string
+		storedRevision int64
+		storedResponse []byte
+	)
+	err = tx.QueryRowContext(ctx,
+		`SELECT request_hash, revision, response FROM operations
+		 WHERE equipment = $1 AND operation_id = $2`,
+		p.Equipment, p.OperationID,
+	).Scan(&storedHash, &storedRevision, &storedResponse)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// First time this operation id is seen: fall through and publish.
+	case err != nil:
+		return nil, err
+	case storedHash != p.RequestHash:
+		return nil, ErrOperationConflict
+	default:
+		return &PublishResult{
+			Equipment: p.Equipment,
+			Revision:  storedRevision,
+			Response:  storedResponse,
+			Replayed:  true,
+		}, nil
 	}
 
 	// Optimistic concurrency: the caller must have seen the current head.
