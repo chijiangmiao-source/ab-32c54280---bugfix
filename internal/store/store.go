@@ -44,34 +44,6 @@ func New(db *sql.DB) *Store { return &Store{db: db} }
 // Ping reports whether the database is reachable (used by /health).
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
-func (s *Store) LookupReplay(ctx context.Context, equipment, operationID, requestHash string) (*PublishResult, error) {
-	var (
-		storedHash string
-		revision   int64
-		response   []byte
-	)
-	err := s.db.QueryRowContext(ctx,
-		`SELECT request_hash, revision, response FROM operations
-		 WHERE equipment = $1 AND operation_id = $2`,
-		equipment, operationID,
-	).Scan(&storedHash, &revision, &response)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if storedHash != requestHash {
-		return nil, ErrOperationConflict
-	}
-	return &PublishResult{
-		Equipment: equipment,
-		Revision:  revision,
-		Response:  response,
-		Replayed:  true,
-	}, nil
-}
-
 // Migrate creates the schema if it does not exist yet. It is idempotent.
 func (s *Store) Migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, schema)
@@ -171,6 +143,20 @@ func (s *Store) Publish(ctx context.Context, p PublishParams) (*PublishResult, e
 		return nil, err
 	}
 
+	// Idempotency first, while holding the head lock: two identical
+	// in-flight calls serialize here, so the loser observes the winner's
+	// just-committed ledger row and replays the exact first result instead
+	// of failing with STALE_REVISION. A reused operation id with different
+	// parameters is a stable conflict regardless of the seen revision.
+	if replay, err := lookupOperation(ctx, tx, p.Equipment, p.OperationID, p.RequestHash); err != nil {
+		return nil, err
+	} else if replay != nil {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return replay, nil
+	}
+
 	// Optimistic concurrency: the caller must have seen the current head.
 	if p.SeenRevision != head {
 		return nil, ErrStaleRevision
@@ -264,6 +250,43 @@ func (s *Store) Query(ctx context.Context, equipment string, batch int64, revisi
 	r.Batch = batch
 	r.Revision = rev
 	return &r, nil
+}
+
+// lookupOperation consults the idempotency ledger for (equipment,
+// operationID). It must run inside a transaction that holds the equipment's
+// head lock, so that a concurrent identical caller either waits for the
+// first publisher's commit or observes its row.
+//
+// It returns:
+//   - nil, nil when the operation id is unknown (a genuine first call);
+//   - a PublishResult carrying the stored first response on an exact retry;
+//   - ErrOperationConflict when the id was recorded with other parameters.
+func lookupOperation(ctx context.Context, tx *sql.Tx, equipment, operationID, requestHash string) (*PublishResult, error) {
+	var (
+		storedHash string
+		revision   int64
+		response   []byte
+	)
+	err := tx.QueryRowContext(ctx,
+		`SELECT request_hash, revision, response FROM operations
+		 WHERE equipment = $1 AND operation_id = $2`,
+		equipment, operationID,
+	).Scan(&storedHash, &revision, &response)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if storedHash != requestHash {
+		return nil, ErrOperationConflict
+	}
+	return &PublishResult{
+		Equipment: equipment,
+		Revision:  revision,
+		Response:  response,
+		Replayed:  true,
+	}, nil
 }
 
 func loadSegments(ctx context.Context, tx *sql.Tx, equipment string, revision int64) ([]split.Segment, error) {

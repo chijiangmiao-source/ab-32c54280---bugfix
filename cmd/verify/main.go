@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -55,6 +56,7 @@ func main() {
 	step("HTTP smoke: interval splitting and coverage", scenarioSplit)
 	step("HTTP smoke: history immutability via API", scenarioHistory)
 	step("HTTP smoke: idempotent replay and operation conflict", scenarioIdempotency)
+	step("HTTP smoke: identical concurrent operation published once", scenarioConcurrentSameOperation)
 	step("HTTP smoke: concurrent stale-revision conflict", scenarioConcurrency)
 	step("HTTP smoke: validation and stable errors", scenarioValidation)
 	if dbURL != "" {
@@ -122,27 +124,32 @@ func waitHealthy() error {
 }
 
 func doJSON(method, rawURL, body string) (int, []byte, error) {
+	st, _, b, err := doJSONFull(method, rawURL, body)
+	return st, b, err
+}
+
+func doJSONFull(method, rawURL, body string) (int, http.Header, []byte, error) {
 	var rdr io.Reader
 	if body != "" {
 		rdr = strings.NewReader(body)
 	}
 	req, err := http.NewRequest(method, rawURL, rdr)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
-	return resp.StatusCode, b, nil
+	return resp.StatusCode, resp.Header, b, nil
 }
 
 func publish(eq, op string, seen, lower, upper int64, content string) (int, []byte, error) {
@@ -150,6 +157,14 @@ func publish(eq, op string, seen, lower, upper int64, content string) (int, []by
 		`{"operation_id":%q,"seen_revision":%d,"lower":%d,"upper":%d,"content":%s}`,
 		op, seen, lower, upper, content)
 	return doJSON(http.MethodPost,
+		fmt.Sprintf("%s/v1/equipments/%s/calibrations", appURL, url.PathEscape(eq)), body)
+}
+
+func publishFull(eq, op string, seen, lower, upper int64, content string) (int, http.Header, []byte, error) {
+	body := fmt.Sprintf(
+		`{"operation_id":%q,"seen_revision":%d,"lower":%d,"upper":%d,"content":%s}`,
+		op, seen, lower, upper, content)
+	return doJSONFull(http.MethodPost,
 		fmt.Sprintf("%s/v1/equipments/%s/calibrations", appURL, url.PathEscape(eq)), body)
 }
 
@@ -490,6 +505,177 @@ func scenarioIdempotency() error {
 	}
 	// The head is still revision 2.
 	return expectQuery(eq, 55, "", 2, 50, 60, `"Z"`)
+}
+
+// scenarioConcurrentSameOperation is the headline idempotency scenario:
+// several engineering stations fire the SAME business operation (identical
+// operation id, seen revision, half-open interval and content) at the same
+// time. The operation must be published exactly once, but every concurrent
+// call must receive the identical first success result; later sequential
+// retries must keep returning that result with the replay marker. The
+// regression tail checks that different parameters still conflict, a
+// different operation on the stale seen revision still loses, no extra
+// revision/history is left behind, and the final interval snapshot matches.
+func scenarioConcurrentSameOperation() error {
+	eq := uniqueEq("EQ-SAMEOP")
+
+	// The device already has a current revision before the stations retry.
+	if err := expectPublish(eq, uniqueOp("p0"), 0, 0, 1000, `"BASE"`, 1,
+		seg(0, 1000, `"BASE"`)); err != nil {
+		return err
+	}
+
+	const callers = 8
+	op := uniqueOp("p1")
+	const seen int64 = 1
+	const lower, upper int64 = 50, 150
+	content := `{"gain":1.5,"recipe":"R1"}`
+	wantSegments := []segment{
+		seg(0, 50, `"BASE"`),
+		seg(50, 150, `{"gain":1.5,"recipe":"R1"}`),
+		seg(150, 1000, `"BASE"`),
+	}
+
+	type outcome struct {
+		status int
+		header http.Header
+		body   []byte
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release every station at once
+			st, hdr, body, err := publishFull(eq, op, seen, lower, upper, content)
+			results <- outcome{st, hdr, body, err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var first []byte
+	var originals, replays int
+	for o := range results {
+		if o.err != nil {
+			return fmt.Errorf("concurrent identical call failed: %w", o.err)
+		}
+		if o.status != http.StatusCreated {
+			return fmt.Errorf("concurrent identical call: status %d, want 201 (body %s)",
+				o.status, o.body)
+		}
+		var pr publishResponse
+		if err := json.Unmarshal(o.body, &pr); err != nil {
+			return fmt.Errorf("concurrent call response not JSON: %v (%s)", err, o.body)
+		}
+		if pr.Equipment != eq {
+			return fmt.Errorf("concurrent call equipment = %q, want %q", pr.Equipment, eq)
+		}
+		if pr.Revision != 2 {
+			return fmt.Errorf("concurrent call revision = %d, want 2 (body %s)",
+				pr.Revision, o.body)
+		}
+		if err := expectSegments(pr.Segments, wantSegments); err != nil {
+			return fmt.Errorf("concurrent call snapshot: %w", err)
+		}
+		if first == nil {
+			first = o.body
+		} else if !bytes.Equal(first, o.body) {
+			return fmt.Errorf("concurrent results diverge:\n first=%s\n other=%s", first, o.body)
+		}
+		switch o.header.Get("X-Idempotent-Replay") {
+		case "":
+			originals++
+		case "true":
+			replays++
+		default:
+			return fmt.Errorf("unexpected X-Idempotent-Replay header %q",
+				o.header.Get("X-Idempotent-Replay"))
+		}
+	}
+	// Exactly one call actually published; every other concurrent call must
+	// have been served from the ledger. This is the direct proof that the
+	// same-operation race cannot end in STALE_REVISION.
+	if originals != 1 || replays != callers-1 {
+		return fmt.Errorf("actual publishes=%d replays=%d, want 1 and %d",
+			originals, replays, callers-1)
+	}
+
+	// Later sequential retries keep returning the same first result, marked
+	// as replays, and never create another revision.
+	for i := 0; i < 3; i++ {
+		st, hdr, body, err := publishFull(eq, op, seen, lower, upper, content)
+		if err != nil {
+			return err
+		}
+		if st != http.StatusCreated || !bytes.Equal(body, first) {
+			return fmt.Errorf("sequential retry %d: status %d body %s, want 201 %s",
+				i+1, st, body, first)
+		}
+		if hdr.Get("X-Idempotent-Replay") != "true" {
+			return fmt.Errorf("sequential retry %d missing X-Idempotent-Replay: true", i+1)
+		}
+	}
+
+	// The head is still revision 2 with exactly the expected snapshot;
+	// boundary probes confirm the final interval state.
+	for _, tc := range []struct {
+		batch        int64
+		lower, upper int64
+		got          string
+	}{
+		{49, 0, 50, `"BASE"`},
+		{50, 50, 150, `{"gain":1.5,"recipe":"R1"}`},
+		{149, 50, 150, `{"gain":1.5,"recipe":"R1"}`},
+		{150, 150, 1000, `"BASE"`},
+	} {
+		if err := expectQuery(eq, tc.batch, "", 2, tc.lower, tc.upper, tc.got); err != nil {
+			return err
+		}
+	}
+
+	// Regression: the same operation id with different parameters is still a
+	// stable conflict (even when retried on the now-stale seen revision).
+	st, body, err := publish(eq, op, seen, lower, upper, `{"gain":2.0,"recipe":"R1"}`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "OPERATION_CONFLICT"); err != nil {
+		return fmt.Errorf("different-parameter reuse: %w", err)
+	}
+
+	// Regression: a DIFFERENT operation id racing on the same stale seen
+	// revision still loses with STALE_REVISION.
+	st, body, err = publish(eq, uniqueOp("p2-stale"), seen, 200, 210, `"X"`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "STALE_REVISION"); err != nil {
+		return fmt.Errorf("different operation on stale revision: %w", err)
+	}
+
+	// Failed transactions left no trace: revision 3 must not exist and the
+	// replay of the original operation still answers with the first result.
+	st, body, err = query(eq, 75, "3")
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusNotFound, "REVISION_NOT_FOUND"); err != nil {
+		return fmt.Errorf("failed call created a revision: %w", err)
+	}
+	st, hdr, body, err := publishFull(eq, op, seen, lower, upper, content)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated || hdr.Get("X-Idempotent-Replay") != "true" || !bytes.Equal(body, first) {
+		return fmt.Errorf("final replay: status %d replay=%q body %s, want 201 replay %s",
+			st, hdr.Get("X-Idempotent-Replay"), body, first)
+	}
+	return nil
 }
 
 // scenarioConcurrency races several publishes on the same seen revision:

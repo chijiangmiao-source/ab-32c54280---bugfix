@@ -109,19 +109,9 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	operationHash := requestHash(equipment, *req.OperationID, *req.SeenRevision,
 		*req.Lower, *req.Upper, content)
-	replay, err := s.st.LookupReplay(r.Context(), equipment, *req.OperationID, operationHash)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	if replay != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Idempotent-Replay", "true")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write(replay.Response)
-		return
-	}
-
+	// The store performs the idempotency-ledger lookup inside the
+	// head-locking transaction (before the stale-revision check), so racing
+	// identical calls observe the winner's result instead of STALE_REVISION.
 	res, err := s.st.Publish(r.Context(), store.PublishParams{
 		Equipment:    equipment,
 		OperationID:  *req.OperationID,
